@@ -143,9 +143,19 @@ fn old_peer_cross_path_ack_does_not_masquerade_as_path_rtt() -> TestResult {
     )?;
     pair.drive();
     pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup)?;
-    pair.set_path_status(Server, path, PathStatus::Backup)?;
+    // Establish a real same-path estimate before introducing a cross-path ACK.
+    // With legacy ACKs, opening path 1 alone may already have invalidated its
+    // initial estimate by acknowledging over the still-preferred path 0.
+    pair.set_path_status(Server, PathId::ZERO, PathStatus::Backup)?;
+    pair.set_path_status(Server, path, PathStatus::Available)?;
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(b"same-path-before").unwrap();
     pair.drive();
-    let recovery_before = pair.path_stats(Client, path).unwrap().rtt;
+    let before = pair.path_stats(Client, path).unwrap();
+    assert!(before.same_path_rtt.is_some(), "valid estimate before first invalidation");
+    let recovery_before = before.rtt;
+    pair.set_path_status(Server, PathId::ZERO, PathStatus::Available)?;
+    pair.set_path_status(Server, path, PathStatus::Backup)?;
     pair.routes.set_latency(Duration::from_millis(200));
     let stream = pair.streams(Client).open(Dir::Uni).unwrap();
     pair.send_stream(Client, stream).write(b"hello").unwrap();
@@ -155,10 +165,29 @@ fn old_peer_cross_path_ack_does_not_masquerade_as_path_rtt() -> TestResult {
         after.rtt, recovery_before,
         "recovery still uses the acknowledgement"
     );
+    assert!(before.same_path_rtt_samples > 0, "a genuine ACK sample preceded invalidation");
+    assert_eq!(after.same_path_rtt_samples, 0, "new epoch has no valid ACK sample");
+    assert_eq!(after.same_path_rtt_epoch, before.same_path_rtt_epoch + 1);
     assert_eq!(
         after.same_path_rtt, None,
         "a cross-path ACK is not a same-path measurement"
     );
+    // Another cross-path ACK leaves the invalid estimate in the same epoch.
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(b"still-cross-path").unwrap();
+    pair.drive();
+    assert_eq!(pair.path_stats(Client, path).unwrap().same_path_rtt_epoch,
+        after.same_path_rtt_epoch);
+    // Restoring same-path ACKs produces a new sample in the new epoch.
+    pair.set_path_status(Server, PathId::ZERO, PathStatus::Backup)?;
+    pair.set_path_status(Server, path, PathStatus::Available)?;
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(b"same-path-again").unwrap();
+    pair.drive();
+    let recovered = pair.path_stats(Client, path).unwrap();
+    assert!(recovered.same_path_rtt.is_some());
+    assert!(recovered.same_path_rtt_samples > after.same_path_rtt_samples);
+    assert_eq!(recovered.same_path_rtt_epoch, after.same_path_rtt_epoch);
     Ok(())
 }
 
@@ -190,6 +219,10 @@ fn same_path_rtt_on_lan_not_inflated_by_ack_delay() -> TestResult {
     assert_eq!(client_rtt, Duration::from_millis(4));
     assert_eq!(server_rtt, Duration::from_millis(4));
 
+    let before = pair.path_stats(Client, path).unwrap();
+    assert_eq!(pair.path_stats(Client, path).unwrap().same_path_rtt_samples,
+        before.same_path_rtt_samples, "reading a snapshot is not a sample");
+
     // Sending a single-packet message on the path should keep same_path_rtt at the true 4ms RTT
     // rather than inflating it by max_ack_delay (25ms).
     pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup)?;
@@ -204,6 +237,10 @@ fn same_path_rtt_on_lan_not_inflated_by_ack_delay() -> TestResult {
         .same_path_rtt
         .unwrap();
     assert_eq!(client_rtt_after, Duration::from_millis(4));
+    let after = pair.path_stats(Client, path).unwrap();
+    assert_eq!(after.path_generation, before.path_generation);
+    assert!(after.same_path_rtt_samples > before.same_path_rtt_samples,
+        "an identical RTT value from a new ACK is still a new sample");
     Ok(())
 }
 

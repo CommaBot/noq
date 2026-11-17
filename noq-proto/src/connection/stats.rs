@@ -220,6 +220,19 @@ pub struct PathStats {
     pub rtt: Duration,
     /// RTT measured on this path in both directions, or none if the latest ACK used another path.
     pub same_path_rtt: Option<Duration>,
+    /// Path incarnation within this connection, including migrations of the same path ID.
+    pub path_generation: u64,
+    /// Number of same-path ACK samples recorded in the current validity epoch.
+    ///
+    /// Only actual same-path ACK measurements increment this counter, even when
+    /// the RTT value is unchanged. Invalidation advances `same_path_rtt_epoch` and
+    /// resets this counter to zero. Repeated reads and PATH_RESPONSE initial
+    /// estimates do not increment it. Compare only within the same connection,
+    /// `path_generation` and `same_path_rtt_epoch`.
+    pub same_path_rtt_samples: u64,
+    /// Number of times a same-path estimate has become invalid in this incarnation.
+    /// Changes let observers detect an invalidation even if they missed the `None` snapshot.
+    pub same_path_rtt_epoch: u64,
     /// Statistics about datagrams and bytes sent on this path.
     pub udp_tx: UdpStats,
     /// Statistics about datagrams and bytes received on this path.
@@ -286,6 +299,9 @@ impl std::ops::Add<PathStats> for ConnectionStats {
         let PathStats {
             rtt: _,
             same_path_rtt: _,
+            path_generation: _,
+            same_path_rtt_samples: _,
+            same_path_rtt_epoch: _,
             udp_tx,
             udp_rx,
             frame_tx,
@@ -320,6 +336,9 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
         let PathStats {
             rtt: _,
             same_path_rtt: _,
+            path_generation: _,
+            same_path_rtt_samples: _,
+            same_path_rtt_epoch: _,
             udp_tx: path_udp_tx,
             udp_rx: path_udp_rx,
             frame_tx: path_frame_tx,

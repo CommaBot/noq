@@ -2713,6 +2713,9 @@ impl Connection {
         let mut stats = self.path_stats.get(path_id).unwrap_or_default();
         stats.rtt = path.data.rtt.get();
         stats.same_path_rtt = path.data.same_path_rtt.map(|rtt| rtt.get());
+        stats.path_generation = path.data.generation();
+        stats.same_path_rtt_samples = path.data.same_path_rtt_samples;
+        stats.same_path_rtt_epoch = path.data.same_path_rtt_epoch;
         stats.cwnd = path.data.congestion.window();
         stats.current_mtu = path.data.mtud.current_mtu();
         Some(stats)
@@ -3093,9 +3096,13 @@ impl Connection {
                     .same_path_rtt
                     .get_or_insert_with(|| paths::RttEstimator::new(rtt))
                     .update(ack_delay, rtt);
+                path_data.same_path_rtt_samples = path_data.same_path_rtt_samples.saturating_add(1);
             } else {
                 // The recovery estimate includes both paths, so it cannot describe either one.
-                path_data.same_path_rtt = None;
+                if path_data.same_path_rtt.take().is_some() {
+                    path_data.same_path_rtt_epoch = path_data.same_path_rtt_epoch.saturating_add(1);
+                    path_data.same_path_rtt_samples = 0;
+                }
             }
             if path_data.first_packet_after_rtt_sample.is_none() {
                 path_data.first_packet_after_rtt_sample = Some((space.kind(), next_pn));

@@ -164,6 +164,9 @@ pub(super) struct PathData {
     pub(super) rtt: RttEstimator,
     /// RTT samples whose outbound and return packets both used this path.
     pub(super) same_path_rtt: Option<RttEstimator>,
+    /// Actual ACK samples in the current validity epoch, excluding PATH_RESPONSE estimates.
+    pub(super) same_path_rtt_samples: u64,
+    pub(super) same_path_rtt_epoch: u64,
     /// Whether we're enabling ECN on outgoing packets
     pub(super) sending_ecn: bool,
     /// Congestion controller state
@@ -305,6 +308,8 @@ impl PathData {
             network_path,
             rtt: RttEstimator::new(config.initial_rtt),
             same_path_rtt: None,
+            same_path_rtt_samples: 0,
+            same_path_rtt_epoch: 0,
             sending_ecn: true,
             pacing: Pacer::new(
                 config.initial_rtt,
@@ -368,6 +373,8 @@ impl PathData {
             network_path,
             rtt: prev.rtt,
             same_path_rtt: None,
+            same_path_rtt_samples: 0,
+            same_path_rtt_epoch: 0,
             pacing: Pacer::new(
                 smoothed_rtt,
                 congestion.window(),
