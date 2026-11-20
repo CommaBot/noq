@@ -5111,3 +5111,165 @@ fn regression_initial_coalescing_large_cid() {
     pair.time += Duration::from_secs(5);
     pair.drive_client(); // this used to try to build a packet without enough datagram space
 }
+
+/// Decodes all coalesced packets inside a single UDP datagram and returns their encryption levels.
+fn decode_datagram_levels(datagram: &[u8], cid_len: usize) -> Vec<crate::connection::EncryptionLevel> {
+    let mut levels = Vec::new();
+    let mut remaining = Some(BytesMut::from(datagram));
+    let cid_parser = FixedLengthConnectionIdParser::new(cid_len);
+    while let Some(data) = remaining {
+        let (partial, rest) =
+            PartialDecode::new(data, &cid_parser, DEFAULT_SUPPORTED_VERSIONS, true)
+                .expect("valid QUIC packet");
+        levels.push(
+            partial
+                .encryption_level()
+                .expect("packet has encryption level"),
+        );
+        remaining = rest;
+    }
+    levels
+}
+
+/// Prepares a handshaking client that has processed the server's first flight (so it has both
+/// Initial and Handshake keys, and `highest_space >= Handshake`) without yet transmitting a
+/// Handshake packet (so Initial keys have not been discarded yet).
+fn handshaking_client_with_initial_and_handshake_keys() -> (Pair, ConnectionHandle) {
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive_client();
+    pair.drive_server();
+    pair.client.drive_incoming(pair.time);
+    let events: Vec<_> = pair
+        .client
+        .conn_events
+        .remove(&client_ch)
+        .expect("server flight should produce client connection events")
+        .into_iter()
+        .collect();
+    let conn = pair.client_conn_mut(client_ch);
+    for event in events {
+        conn.handle_event(event);
+    }
+    assert!(conn.has_space_keys(crate::packet::SpaceId::Initial));
+    assert!(conn.has_space_keys(crate::packet::SpaceId::Handshake));
+    (pair, client_ch)
+}
+
+#[test]
+fn close_during_handshake_with_single_datagram_does_not_loop() {
+    let _guard = subscribe();
+    let (mut pair, client_ch) = handshaking_client_with_initial_and_handshake_keys();
+    let now = pair.time;
+    let conn = pair.client_conn_mut(client_ch);
+    conn.close(now, VarInt(0), Bytes::new());
+
+    let mut buf = Vec::with_capacity(DEFAULT_MTU);
+    let mut datagrams = 0usize;
+    let mut initial_closes = 0usize;
+    let mut handshake_closes = 0usize;
+    let mut onertt_closes = 0usize;
+
+    for _ in 0..10 {
+        buf.clear();
+        let before_closes = conn.stats().frame_tx.connection_close;
+        let Some(transmit) = conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf) else {
+            break;
+        };
+        datagrams += 1;
+        let after_closes = conn.stats().frame_tx.connection_close;
+        let levels = decode_datagram_levels(&buf[..transmit.size], 8);
+        assert_eq!(
+            after_closes - before_closes,
+            levels.len() as u64,
+            "every packet transmitted while closing must carry CONNECTION_CLOSE, got levels {levels:?}"
+        );
+        for level in levels {
+            match level {
+                crate::connection::EncryptionLevel::Initial => initial_closes += 1,
+                crate::connection::EncryptionLevel::Handshake => handshake_closes += 1,
+                crate::connection::EncryptionLevel::OneRtt => onertt_closes += 1,
+                other => panic!("unexpected encryption level while closing: {other:?}"),
+            }
+        }
+    }
+
+    buf.clear();
+    assert!(
+        conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf).is_none(),
+        "poll_transmit must terminate after closing all active spaces (sent {datagrams} datagrams)"
+    );
+    assert!(datagrams <= 3, "expected at most 3 datagrams, got {datagrams}");
+    assert_eq!(initial_closes, 1, "Initial CONNECTION_CLOSE must be sent once");
+    assert_eq!(handshake_closes, 1, "Handshake CONNECTION_CLOSE must be sent once");
+    assert!(onertt_closes <= 1, "1-RTT CONNECTION_CLOSE must be sent at most once");
+    assert!(!conn.has_pending_connection_close());
+}
+
+#[test]
+fn close_after_initial_aead_limit_exhausted_does_not_panic() {
+    let _guard = subscribe();
+    let (mut pair, client_ch) = handshaking_client_with_initial_and_handshake_keys();
+    let now = pair.time;
+    let conn = pair.client_conn_mut(client_ch);
+    conn.exhaust_initial_aead_budget();
+    conn.close(now, VarInt(0), Bytes::new());
+
+    let mut buf = Vec::with_capacity(DEFAULT_MTU * 10);
+    let transmit = conn.poll_transmit(now, NonZeroUsize::new(10).unwrap(), &mut buf);
+    assert!(transmit.is_none());
+    assert!(buf.is_empty());
+    assert!(conn.is_drained());
+}
+
+#[test]
+fn closed_connection_does_not_send_non_close_packets_between_space_closes() {
+    let _guard = subscribe();
+    let (mut pair, client_ch) = handshaking_client_with_initial_and_handshake_keys();
+    let now = pair.time;
+    let conn = pair.client_conn_mut(client_ch);
+    conn.queue_loss_probe(crate::packet::SpaceId::Initial);
+    conn.close(now, VarInt(0), Bytes::new());
+
+    let mut buf = Vec::with_capacity(DEFAULT_MTU);
+
+    // 1st poll_transmit: Initial CONNECTION_CLOSE
+    let before_1 = conn.stats().frame_tx.connection_close;
+    let t1 = conn
+        .poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+        .expect("first transmit should send Initial CONNECTION_CLOSE");
+    let levels_1 = decode_datagram_levels(&buf[..t1.size], 8);
+    assert_eq!(levels_1, vec![crate::connection::EncryptionLevel::Initial]);
+    assert_eq!(conn.stats().frame_tx.connection_close - before_1, 1);
+
+    // 2nd poll_transmit: Handshake CONNECTION_CLOSE (never a non-close Initial packet)
+    buf.clear();
+    let before_2 = conn.stats().frame_tx.connection_close;
+    let t2 = conn
+        .poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+        .expect("second transmit should send Handshake CONNECTION_CLOSE");
+    let levels_2 = decode_datagram_levels(&buf[..t2.size], 8);
+    assert!(
+        !levels_2.contains(&crate::connection::EncryptionLevel::Initial),
+        "must not send Initial packets after Initial close: {levels_2:?}"
+    );
+    assert!(
+        levels_2.contains(&crate::connection::EncryptionLevel::Handshake),
+        "expected Handshake CONNECTION_CLOSE, got {levels_2:?}"
+    );
+    assert_eq!(
+        conn.stats().frame_tx.connection_close - before_2,
+        levels_2.len() as u64
+    );
+    assert!(
+        !conn.has_space_keys(crate::packet::SpaceId::Initial),
+        "Initial keys must be discarded after sending Handshake packet"
+    );
+
+    // 3rd poll_transmit: nothing left to send
+    buf.clear();
+    assert!(
+        conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf).is_none(),
+        "expected no further transmits after closing all spaces"
+    );
+}

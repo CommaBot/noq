@@ -214,8 +214,8 @@ pub struct Connection {
 
     //
     // Queued non-retransmittable 1-RTT data
-    /// If the CONNECTION_CLOSE frame needs to be sent
-    connection_close_pending: bool,
+    /// Per-space flags indicating whether a CONNECTION_CLOSE frame still needs to be sent
+    connection_close_pending: [bool; 3],
 
     //
     // ACK frequency
@@ -393,7 +393,7 @@ impl Connection {
             },
             timers: TimerTable::default(),
             authentication_failures: 0,
-            connection_close_pending: false,
+            connection_close_pending: [false; 3],
 
             ack_frequency: AckFrequencyState::new(get_max_ack_delay(
                 &TransportParameters::default(),
@@ -1044,9 +1044,9 @@ impl Connection {
                 return None;
             }
             StateType::Draining | StateType::Closed => {
-                // self.connection_close_pending is only reset once the associated packet
-                // had been encoded successfully
-                if !self.connection_close_pending {
+                // Each space's pending flag is cleared once its CONNECTION_CLOSE packet has been
+                // encoded or its keys are discarded.
+                if !self.has_pending_connection_close() {
                     for path in self.paths.values_mut() {
                         path.data.app_limited = true;
                     }
@@ -1074,14 +1074,17 @@ impl Connection {
 
         let mut next_path_id = self.paths.first_entry().map(|e| *e.key());
         while let Some(path_id) = next_path_id {
-            if !connection_close_pending
-                && let Some(transmit) = self.poll_transmit_off_path(now, buf, path_id)
-            {
-                #[cfg(test)]
-                {
-                    self.partial_stats.transmits_tx += 1;
+            if !connection_close_pending {
+                if let Some(transmit) = self.poll_transmit_off_path(now, buf, path_id) {
+                    #[cfg(test)]
+                    {
+                        self.partial_stats.transmits_tx += 1;
+                    }
+                    return Some(transmit);
                 }
-                return Some(transmit);
+                if self.state.is_drained() {
+                    return None;
+                }
             }
 
             let info = self.scheduling_info(path_id);
@@ -1098,6 +1101,9 @@ impl Connection {
                     self.partial_stats.transmits_tx += 1;
                 }
                 return Some(transmit);
+            }
+            if self.state.is_drained() {
+                return None;
             }
 
             // Continue checking other paths, tail-loss probes may need to be sent
@@ -1404,6 +1410,10 @@ impl Connection {
                     last_packet_number = Some(pn);
                     break;
                 }
+                PollPathSpaceStatus::Drained => {
+                    buf.clear();
+                    return None;
+                }
             }
         }
 
@@ -1488,33 +1498,30 @@ impl Connection {
             let can_send =
                 self.space_can_send(space_id, path_id, max_packet_size, connection_close_pending);
             let needs_loss_probe = self.spaces[space_id].for_path(path_id).loss_probes > 0;
-            let space_will_send = {
-                if scheduling_info.is_abandoned {
-                    // If this path is abandoned then we might still have to send
-                    // PATH_ABANDON itself on it if there was no better space
-                    // available. Otherwise we want to send the PATH_ABANDON as permitted by
-                    // may_send_data however.
-                    scheduling_info.may_self_abandon
-                        && self.spaces[space_id]
-                            .pending
-                            .path_abandon
-                            .contains_key(&path_id)
-                } else if can_send.close && scheduling_info.may_send_close {
-                    // This is the best path to send a CONNECTION_CLOSE on.
-                    true
-                } else if needs_loss_probe
-                    || can_send.space_specific
-                    || (can_send.acks && (self.same_path_acks() || scheduling_info.may_send_data))
-                {
-                    // We always send a loss probe or space-specific frames if the path is
-                    // not abandoned. ACKs also go on the path being acknowledged, even if
-                    // it is a backup, so they can measure that path's round trip.
-                    true
-                } else {
-                    // Anything else we only send if we're the best path for SpaceKind::Data
-                    // frames.
-                    !can_send.is_empty() && scheduling_info.may_send_data
-                }
+            let space_will_send = if connection_close_pending {
+                can_send.close && scheduling_info.may_send_close
+            } else if scheduling_info.is_abandoned {
+                // If this path is abandoned then we might still have to send
+                // PATH_ABANDON itself on it if there was no better space
+                // available. Otherwise we want to send the PATH_ABANDON as permitted by
+                // may_send_data however.
+                scheduling_info.may_self_abandon
+                    && self.spaces[space_id]
+                        .pending
+                        .path_abandon
+                        .contains_key(&path_id)
+            } else if needs_loss_probe
+                || can_send.space_specific
+                || (can_send.acks && (self.same_path_acks() || scheduling_info.may_send_data))
+            {
+                // We always send a loss probe or space-specific frames if the path is
+                // not abandoned. ACKs also go on the path being acknowledged, even if
+                // it is a backup, so they can measure that path's round trip.
+                true
+            } else {
+                // Anything else we only send if we're the best path for SpaceKind::Data
+                // frames.
+                !can_send.is_empty() && scheduling_info.may_send_data
             };
 
             if !space_will_send {
@@ -1624,15 +1631,10 @@ impl Connection {
             let Some(mut builder) =
                 PacketBuilder::new(now, space_id, path_id, remote_cid, transmit, self)
             else {
-                // Confidentiality limit is exceeded and the connection has been killed. We
-                // should not send any other packets. This works in a roundabout way: We
-                // have started a datagram but not written anything into it. So even if we
-                // get called again for another space we will see an already started
-                // datagram and try and start another packet here. Then be stopped by the
-                // same confidentiality limit.
-                return PollPathSpaceStatus::NothingToSend {
-                    path_blocked: PathBlocked::No,
-                };
+                // Confidentiality limit is exceeded and the connection has been killed
+                // (moved to `State::Drained`). Abort transmitting immediately so higher spaces
+                // and other paths do not try to build further packets for a drained connection.
+                return PollPathSpaceStatus::Drained;
             };
             last_packet_number = Some(builder.packet_number);
 
@@ -1706,23 +1708,16 @@ impl Connection {
                 }
                 let last_pn = builder.packet_number;
                 builder.finish_and_track(now, self, path_id, pad_datagram);
-                if space_id.kind() == self.highest_space {
-                    // Don't send another close packet. Even with multipath we only send
-                    // CONNECTION_CLOSE on a single path since we expect our paths to work.
-                    self.connection_close_pending = false;
-                }
+                // Don't send another close packet in this space. Even with multipath we only send
+                // CONNECTION_CLOSE on a single path since we expect our paths to work.
+                self.connection_close_pending[space_id as usize] = false;
                 // Send a close frame in every possible space for robustness, per
                 // RFC9000 "Immediate Close during the Handshake". Don't bother trying
                 // to send anything else.
-                // TODO(flub): This breaks during the handshake if we can not coalesce
-                //    packets due to space reasons: the next space would either fail a
-                //    debug_assert checking for enough packet space or produce an invalid
-                //    packet. We need to keep track of per-space pending CONNECTION_CLOSE to
-                //    be able to send these across multiple calls to poll_transmit. Then
-                //    check for coalescing space here because initial packets need to be in
-                //    padded datagrams. And also add space checks for CONNECTION_CLOSE in
-                //    space_can_send so it would stop a GSO batch if the datagram is too
-                //    small for another CONNECTION_CLOSE packet.
+                // TODO(flub): Check for coalescing space here because initial packets need to be
+                //    in padded datagrams, and add space checks for CONNECTION_CLOSE in
+                //    space_can_send so it would stop a GSO batch if the datagram is too small for
+                //    another CONNECTION_CLOSE packet.
                 return PollPathSpaceStatus::WrotePacket {
                     last_packet_number: last_pn,
                     pad_datagram,
@@ -2250,9 +2245,28 @@ impl Connection {
             can_send |= self.can_send_1rtt(path_id, frame_space_1rtt);
         }
 
-        can_send.close = connection_close_pending && space_has_crypto;
+        can_send.close = connection_close_pending
+            && self.connection_close_pending[space_id as usize]
+            && space_has_crypto;
 
         can_send
+    }
+
+    /// Schedule a `CONNECTION_CLOSE` frame in every packet number space that currently has keys.
+    fn schedule_connection_close(&mut self) {
+        for space_id in SpaceId::iter() {
+            if self.crypto_state.has_keys(space_id.encryption_level()) {
+                self.connection_close_pending[space_id as usize] = true;
+            }
+        }
+    }
+
+    /// Whether any packet number space with active keys still needs to send `CONNECTION_CLOSE`.
+    pub(crate) fn has_pending_connection_close(&self) -> bool {
+        SpaceId::iter().any(|space_id| {
+            self.connection_close_pending[space_id as usize]
+                && self.crypto_state.has_keys(space_id.encryption_level())
+        })
     }
 
     /// Process `ConnectionEvent`s generated by the associated `Endpoint`
@@ -2543,7 +2557,7 @@ impl Connection {
                             );
                             self.close_common();
                             self.set_close_timer(now);
-                            self.connection_close_pending = true;
+                            self.schedule_connection_close();
                             self.state.move_to_closed(err);
                         }
                     }
@@ -2682,7 +2696,7 @@ impl Connection {
         if !was_closed {
             self.close_common();
             self.set_close_timer(now);
-            self.connection_close_pending = true;
+            self.schedule_connection_close();
             self.state.move_to_closed_local(reason);
         }
     }
@@ -4210,6 +4224,7 @@ impl Connection {
             }
         }
         self.crypto_state.spaces[space].keys = None;
+        self.connection_close_pending[space as usize] = false;
         let space = &mut self.spaces[space];
         let pns = space.for_path(PathId::ZERO);
         pns.time_of_last_ack_eliciting_packet = None;
@@ -4541,7 +4556,7 @@ impl Connection {
                 .map(|p| p.data.validated && p.data.network_path == network_path)
                 .unwrap_or(false)
             {
-                self.connection_close_pending = true;
+                self.schedule_connection_close();
             }
         }
     }
@@ -5621,7 +5636,7 @@ impl Connection {
         if let Some(reason) = close {
             self.state
                 .move_to_draining(Some(reason.into()), &mut self.endpoint_events);
-            self.connection_close_pending = true;
+            self.schedule_connection_close();
         }
 
         // For Multipath any packet triggers migration. For RFC9000 or QNT (+ Multipath)
@@ -6999,8 +7014,32 @@ impl Connection {
             if !self.state.is_drained() {
                 self.set_close_timer(now);
             }
-            self.connection_close_pending = true;
+            self.schedule_connection_close();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_space_keys(&self, space: SpaceId) -> bool {
+        self.crypto_state.has_keys(space.encryption_level())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_loss_probe(&mut self, space: SpaceId) {
+        self.spaces[space].for_path(PathId::ZERO).loss_probes += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_initial_aead_budget(&mut self) {
+        let remaining = self
+            .crypto_state
+            .remaining_packet_budget(EncryptionLevel::Initial)
+            .expect("initial keys must be present");
+        self.crypto_state.spaces[SpaceKind::Initial].sent_with_keys += remaining;
+        assert_eq!(
+            self.crypto_state
+                .remaining_packet_budget(EncryptionLevel::Initial),
+            Some(0)
+        );
     }
 
     /// Whether we have **on-path** 1-RTT data to send.
@@ -7362,6 +7401,9 @@ enum PollPathSpaceStatus {
         /// The highest packet number written into the transmit.
         last_packet_number: u64,
     },
+    /// The connection became drained while building a packet (e.g. AEAD confidentiality limit
+    /// exceeded); no further spaces or paths may transmit.
+    Drained,
 }
 
 /// Information used to decide what frames to schedule into which packets.
