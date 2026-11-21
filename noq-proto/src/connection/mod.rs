@@ -586,6 +586,10 @@ impl Connection {
 
         let path = self.create_path(path_id, network_path, now, None);
         path.status.local_update(initial_status);
+        let validated = path.validated;
+        if validated {
+            self.abandon_pending_idle_paths(now);
+        }
 
         Ok(path_id)
     }
@@ -661,6 +665,47 @@ impl Connection {
         }
 
         Ok(())
+    }
+
+    /// Whether another open, validated, non-pending-idle path with remote CIDs is ready to send.
+    fn has_usable_replacement_path(&self, excluding: Option<PathId>) -> bool {
+        self.paths.iter().any(|(&id, state)| {
+            Some(id) != excluding
+                && !self.abandoned_paths.contains(&id)
+                && !state.data.pending_idle_abandon
+                && state.data.validated
+                && self.remote_cids.contains_key(&id)
+        })
+    }
+
+    /// Reclaims any paths whose per-path idle timeout had to be deferred while no validated
+    /// replacement path was usable.
+    fn abandon_pending_idle_paths(&mut self, now: Instant) {
+        if self.state.is_drained()
+            || !self.is_multipath_negotiated()
+            || !self.has_usable_replacement_path(None)
+        {
+            return;
+        }
+        let pending: Vec<PathId> = self
+            .paths
+            .iter()
+            .filter_map(|(&id, state)| {
+                (state.data.pending_idle_abandon && !self.abandoned_paths.contains(&id))
+                    .then_some(id)
+            })
+            .collect();
+        for id in pending {
+            if !self.has_usable_replacement_path(Some(id)) {
+                break;
+            }
+            if let Some(path) = self.paths.get_mut(&id) {
+                path.data.pending_idle_abandon = false;
+            }
+            if let Err(err) = self.close_path_inner(now, id, PathAbandonReason::TimedOut) {
+                warn!(%id, ?err, "failed closing pending-idle path");
+            }
+        }
     }
 
     /// Unconditionally abandon a path.
@@ -868,6 +913,7 @@ impl Connection {
         // it's likely that the computed value was in the future, and instead of accounting for
         // elapsed idle time, it further extended the timer. Then, for consistency, we simply choose
         // to compute the timer expiration in the same way as if the path had been immediately used.
+        path.data.pending_idle_abandon = false;
         self.rearm_path_max_idle_timer(now, self.highest_space, path_id);
 
         Ok(prev_timeout)
@@ -921,6 +967,7 @@ impl Connection {
     ) -> Option<(&PathId, &PathState)> {
         self.paths.iter().find(|(path_id, path_state)| {
             path_state.data.validated
+                && !path_state.data.pending_idle_abandon
                 // Would this use the same network path, if network_path were used to send right now?
                 && network_path.is_probably_same_path(&path_state.data.network_path)
                 && !self.abandoned_paths.contains(path_id)
@@ -2583,6 +2630,12 @@ impl Connection {
                             if let Err(err) =
                                 self.close_path_inner(now, path_id, PathAbandonReason::TimedOut)
                             {
+                                if matches!(err, ClosePathError::LastOpenPath)
+                                    && let Some(path) = self.paths.get_mut(&path_id)
+                                {
+                                    path.data.pending_idle_abandon = true;
+                                    path.data.permit_idle_reset = false;
+                                }
                                 warn!(?err, "failed closing path");
                             }
                         }
@@ -3862,7 +3915,9 @@ impl Connection {
         self.total_authed_packets += 1;
         self.reset_keep_alive(path_id, now);
         self.reset_idle_timeout(now, space_id, path_id);
-        self.path_data_mut(path_id).permit_idle_reset = true;
+        let path_data = self.path_data_mut(path_id);
+        path_data.pending_idle_abandon = false;
+        path_data.permit_idle_reset = true;
 
         // Do not process ECN for off-path packets. If this is a migration we'll get ECN
         // back once we've migrated.
@@ -4448,6 +4503,7 @@ impl Connection {
                         if self.side().is_server() && !self.abandoned_paths.contains(&path_id) {
                             // Only the client is allowed to open paths
                             self.create_path(path_id, network_path, now, pn);
+                            self.abandon_pending_idle_paths(now);
                         }
                         if self.paths.contains_key(&path_id) {
                             self.on_packet_authenticated(
@@ -5286,6 +5342,7 @@ impl Connection {
                         // let's switch immediately to enable clientside stateless resets.
                         self.update_remote_cid(PathId::ZERO);
                     }
+                    self.abandon_pending_idle_paths(now);
                 }
                 Frame::NewToken(NewToken { token }) => {
                     let ConnectionSide::Client {
@@ -5745,6 +5802,7 @@ impl Connection {
                     // re-validate the previous path.
                     prev.reset_on_path_challenges();
                 }
+                self.abandon_pending_idle_paths(now);
             }
             paths::OnPathResponseReceived::OnPath => {
                 trace!(

@@ -2445,3 +2445,186 @@ fn regression_discarded_path_stats_are_up_to_date() -> TestResult {
 
     Ok(())
 }
+
+#[test]
+fn last_open_path_idle_timeout_reclaimed_once_replacement_validates() -> TestResult {
+    let _guard = subscribe();
+    let client_addr_two = "[::1:2]:1".parse()?;
+    let server_addr_two = "[::2:2]:1".parse()?;
+
+    let mut builder = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .with_routes(ManyToManyRouting::from_routes(
+            [(Pair::CLIENT_ADDR, 0), (client_addr_two, 1)],
+            [(Pair::SERVER_ADDR, 0), (server_addr_two, 1)],
+        ));
+    builder
+        .client_transport_cfg
+        .default_path_max_idle_timeout(Some(Duration::from_secs(3)))
+        .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
+    builder
+        .server_transport_cfg
+        .default_path_max_idle_timeout(Some(Duration::from_secs(60)))
+        .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
+    let mut pair = builder.connect();
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+
+    // Cut route 0 in both directions while leaving route 1 intact.
+    pair.routes = ManyToManyRouting::from_routes(
+        [(Pair::CLIENT_ADDR, 1), (client_addr_two, 1)],
+        [("[::2:99]:1".parse::<SocketAddr>()?, 1), (server_addr_two, 1)],
+    )
+    .into();
+
+    // Advance past PathId::ZERO's 3-second idle timeout while it is the sole open path.
+    pair.time += Duration::from_secs(4);
+    let now = pair.time;
+    pair.conn_mut(Client).handle_timeout(now);
+    assert!(!pair.is_closed(Client));
+    assert!(
+        pair.path_status(Client, PathId::ZERO).is_ok(),
+        "last open path must stay retained until a replacement validates"
+    );
+    while let Some(event) = pair.poll(Client) {
+        assert!(
+            !matches!(event, Event::Path(PathEvent::Abandoned { id: PathId::ZERO, .. })),
+            "last open path must not abandon before replacement exists: {event:?}"
+        );
+    }
+
+    // Open a replacement path on route 1. Merely creating the path and transmitting its
+    // PATH_CHALLENGE (before PATH_RESPONSE arrives) must NOT abandon PathId::ZERO yet.
+    let replacement = FourTuple {
+        remote: server_addr_two,
+        local_ip: Some(client_addr_two.ip()),
+    };
+    let path1 = pair.open_path(Client, replacement, PathStatus::Available)?;
+    pair.drive_client();
+    while let Some(event) = pair.poll(Client) {
+        assert!(
+            !matches!(event, Event::Path(PathEvent::Abandoned { id: PathId::ZERO, .. })),
+            "creating or probing an unvalidated path must not abandon last usable path: {event:?}"
+        );
+    }
+
+    // Complete validation on path1: PathId::ZERO must now be abandoned immediately with TimedOut,
+    // and the peer must replenish the client's MAX_PATH_ID credit so MAX_PATHS new paths still fit.
+    pair.drive();
+
+    let mut client_established_1 = false;
+    let mut client_abandoned_0 = false;
+    while let Some(event) = pair.poll(Client) {
+        match event {
+            Event::Path(PathEvent::Established { id }) if id == path1 => {
+                client_established_1 = true;
+            }
+            Event::Path(PathEvent::Abandoned {
+                id: PathId::ZERO,
+                reason: PathAbandonReason::TimedOut,
+            }) => {
+                client_abandoned_0 = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(client_established_1, "replacement path1 should establish");
+    assert!(
+        client_abandoned_0,
+        "pending-idle PathId::ZERO must abandon as soon as path1 validates"
+    );
+
+    let mut server_abandoned_0 = false;
+    while let Some(event) = pair.poll(Server) {
+        if matches!(
+            event,
+            Event::Path(PathEvent::Abandoned {
+                id: PathId::ZERO,
+                reason: PathAbandonReason::RemoteAbandoned { .. },
+            })
+        ) {
+            server_abandoned_0 = true;
+        }
+    }
+    assert!(server_abandoned_0, "server must receive PATH_ABANDON for PathId::ZERO");
+
+    // Verify MAX_PATH_ID credit was replenished by opening (MAX_PATHS - 1) additional paths up to
+    // PathId(MAX_PATHS), which would fail with MaxPathIdReached if PathId::ZERO had not retired.
+    for _ in 2..=MAX_PATHS {
+        let next_id = pair.open_path(Client, replacement, PathStatus::Backup)?;
+        pair.drive();
+        assert!(pair.path_status(Client, next_id).is_ok());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn pending_idle_last_open_path_revived_by_inbound_packet_stays_open() -> TestResult {
+    let _guard = subscribe();
+    let client_addr_two = "[::1:2]:1".parse()?;
+    let server_addr_two = "[::2:2]:1".parse()?;
+
+    let mut builder = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .with_routes(ManyToManyRouting::from_routes(
+            [(Pair::CLIENT_ADDR, 0), (client_addr_two, 1)],
+            [(Pair::SERVER_ADDR, 0), (server_addr_two, 1)],
+        ));
+    builder
+        .client_transport_cfg
+        .default_path_max_idle_timeout(Some(Duration::from_secs(3)))
+        .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
+    builder
+        .server_transport_cfg
+        .default_path_max_idle_timeout(Some(Duration::from_secs(60)))
+        .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
+    let mut pair = builder.connect();
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+
+    // Cut route 0 and fire PathId::ZERO's idle timeout while it is the sole open path.
+    pair.routes = ManyToManyRouting::from_routes(
+        [(Pair::CLIENT_ADDR, 1), (client_addr_two, 1)],
+        [("[::2:99]:1".parse::<SocketAddr>()?, 1), (server_addr_two, 1)],
+    )
+    .into();
+    pair.time += Duration::from_secs(4);
+    let now = pair.time;
+    pair.conn_mut(Client).handle_timeout(now);
+
+    // Restore route 0 and deliver an authenticated packet from the server on PathId::ZERO before
+    // any replacement path validates.
+    pair.routes = ManyToManyRouting::from_routes(
+        [(Pair::CLIENT_ADDR, 0), (client_addr_two, 1)],
+        [(Pair::SERVER_ADDR, 0), (server_addr_two, 1)],
+    )
+    .into();
+    pair.ping_path(Server, PathId::ZERO)?;
+    pair.drive();
+
+    // Now open and validate path1 on route 1: PathId::ZERO revived and must NOT be abandoned.
+    let replacement = FourTuple {
+        remote: server_addr_two,
+        local_ip: Some(client_addr_two.ip()),
+    };
+    let path1 = pair.open_path(Client, replacement, PathStatus::Backup)?;
+    pair.drive();
+
+    let mut established_1 = false;
+    while let Some(event) = pair.poll(Client) {
+        assert!(
+            !matches!(event, Event::Path(PathEvent::Abandoned { id: PathId::ZERO, .. })),
+            "revived PathId::ZERO must not be abandoned when path1 validates: {event:?}"
+        );
+        if matches!(event, Event::Path(PathEvent::Established { id }) if id == path1) {
+            established_1 = true;
+        }
+    }
+    assert!(established_1);
+    assert!(pair.path_status(Client, PathId::ZERO).is_ok());
+
+    Ok(())
+}
