@@ -270,6 +270,9 @@ pub(super) struct PathData {
     /// timer firing while the sent packet is in-fight. See
     /// <https://www.rfc-editor.org/rfc/rfc9000.html#section-10.1>.
     pub(super) permit_idle_reset: bool,
+    /// Whether this path already exceeded its per-path idle timeout while it was the last usable
+    /// path, and should be abandoned as soon as a validated replacement path can carry frames.
+    pub(super) pending_idle_abandon: bool,
 
     /// Whether we're currently draining the path after having abandoned it.
     ///
@@ -351,6 +354,7 @@ impl PathData {
             idle_timeout: config.default_path_max_idle_timeout,
             keep_alive: config.default_path_keep_alive_interval,
             permit_idle_reset: true,
+            pending_idle_abandon: false,
             draining: false,
             #[cfg(feature = "qlog")]
             recovery_metrics: RecoveryMetrics::default(),
@@ -402,6 +406,7 @@ impl PathData {
             idle_timeout: prev.idle_timeout,
             keep_alive: prev.keep_alive,
             permit_idle_reset: true,
+            pending_idle_abandon: false,
             draining: false,
             #[cfg(feature = "qlog")]
             recovery_metrics: prev.recovery_metrics.clone(),
